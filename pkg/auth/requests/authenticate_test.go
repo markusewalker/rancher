@@ -10,6 +10,7 @@ import (
 
 	"github.com/rancher/norman/types"
 	apiv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/auth/accessor"
 	"github.com/rancher/rancher/pkg/auth/providers"
 	"github.com/rancher/rancher/pkg/auth/providers/common"
 	"github.com/rancher/rancher/pkg/clusterrouter"
@@ -55,11 +56,11 @@ func (p *fakeProvider) IsDisabledProvider() (bool, error) {
 	return p.disabled, nil
 }
 
-func (p *fakeProvider) Logout(apiContext *types.APIContext, token *v3.Token) error {
+func (p *fakeProvider) Logout(apiContext *types.APIContext, token accessor.TokenAccessor) error {
 	panic("not implemented")
 }
 
-func (p *fakeProvider) LogoutAll(apiContext *types.APIContext, token *v3.Token) error {
+func (p *fakeProvider) LogoutAll(apiContext *types.APIContext, token accessor.TokenAccessor) error {
 	panic("not implemented")
 }
 
@@ -71,11 +72,11 @@ func (p *fakeProvider) AuthenticateUser(ctx context.Context, input interface{}) 
 	panic("not implemented")
 }
 
-func (p *fakeProvider) SearchPrincipals(name, principalType string, myToken v3.Token) ([]v3.Principal, error) {
+func (p *fakeProvider) SearchPrincipals(name, principalType string, myToken accessor.TokenAccessor) ([]v3.Principal, error) {
 	panic("not implemented")
 }
 
-func (p *fakeProvider) GetPrincipal(principalID string, token v3.Token) (v3.Principal, error) {
+func (p *fakeProvider) GetPrincipal(principalID string, token accessor.TokenAccessor) (v3.Principal, error) {
 	panic("not implemented")
 }
 
