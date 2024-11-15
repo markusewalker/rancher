@@ -357,20 +357,8 @@ func extVerifyToken(storedToken *ext.Token, tokenName, tokenKey string) (int, er
 		return http.StatusUnprocessableEntity, invalidAuthTokenErr
 	}
 
-	if extIsExpired(storedToken) {
+	if storedToken.Expired {
 		return http.StatusGone, errors.New("must authenticate")
 	}
 	return http.StatusOK, nil
-}
-
-func extIsExpired(token *ext.Token) bool {
-	if token.Spec.TTL == 0 {
-		return false
-	}
-
-	created := token.ObjectMeta.CreationTimestamp.Time
-	durationElapsed := time.Since(created)
-	ttlDuration := time.Duration(token.Spec.TTL) * time.Millisecond
-
-	return durationElapsed.Seconds() >= ttlDuration.Seconds()
 }
