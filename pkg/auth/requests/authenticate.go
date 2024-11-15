@@ -357,7 +357,7 @@ func extVerifyToken(storedToken *ext.Token, tokenName, tokenKey string) (int, er
 		return http.StatusUnprocessableEntity, invalidAuthTokenErr
 	}
 
-	if storedToken.Expired {
+	if storedToken.Status.Expired {
 		return http.StatusGone, errors.New("must authenticate")
 	}
 	return http.StatusOK, nil
