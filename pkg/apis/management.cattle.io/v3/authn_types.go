@@ -49,6 +49,10 @@ type Token struct {
 
 // Implement the TokenAccessor interface
 
+func (t *Token) GetLUAFieldPath() string {
+	return "/lastUsedAt"
+}
+
 func (t *Token) GetName() string {
 	return t.ObjectMeta.Name
 }

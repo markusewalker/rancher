@@ -108,6 +108,10 @@ type TokenStatus struct {
 
 // Implement the TokenAccessor interface
 
+func (t *Token) GetLUAFieldPath() string {
+	return "/status/lastUsedAt"
+}
+
 func (t *Token) GetName() string {
 	return t.ObjectMeta.Name
 }
