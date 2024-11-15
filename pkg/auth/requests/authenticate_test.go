@@ -9,17 +9,20 @@ import (
 	"time"
 
 	"github.com/rancher/norman/types"
+	ext "github.com/rancher/rancher/pkg/apis/ext.cattle.io/v1"
 	apiv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/auth/accessor"
 	"github.com/rancher/rancher/pkg/auth/providers"
 	"github.com/rancher/rancher/pkg/auth/providers/common"
 	"github.com/rancher/rancher/pkg/clusterrouter"
+	exttokenstore "github.com/rancher/rancher/pkg/ext/stores/tokens"
 	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
 	mgmtFakes "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3/fakes"
 	"github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -606,6 +609,536 @@ func TestTokenAuthenticatorAuthenticate(t *testing.T) {
 		oldTokenCreationTimestamp := token.CreationTimestamp
 		defer func() { token.CreationTimestamp = oldTokenCreationTimestamp }()
 		token.CreationTimestamp = metav1.NewTime(now.Add(-time.Duration(token.TTLMillis)*time.Millisecond - 1))
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.ErrorIs(t, err, ErrMustAuthenticate)
+		require.Nil(t, resp)
+		assert.False(t, userRefresher.called)
+	})
+}
+
+func TestTokenAuthenticatorAuthenticateExtToken(t *testing.T) {
+	existingProviders := providers.Providers
+	defer func() {
+		providers.Providers = existingProviders
+	}()
+
+	fakeProvider := &fakeProvider{
+		name: "fake",
+	}
+	providers.Providers = map[string]common.AuthProvider{
+		fakeProvider.name: fakeProvider,
+	}
+
+	now := time.Now()
+	userID := "u-abcdef"
+	userPrincipalID := fakeProvider.name + "_user://12345"
+
+	user := &v3.User{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: userID,
+		},
+		DisplayName:  "fake-user",
+		PrincipalIDs: []string{userPrincipalID},
+	}
+
+	tokenValue := "jnb9tksmnctvgbn92ngbkptblcjwg4pmfp98wqj29wk5kv85ktg59s"
+	// note: ext tokens do not store their token value/secret
+	tokenHash := "0-493l;adkfpakjdf"
+	token := &ext.Token{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "token-v2rcx",
+			CreationTimestamp: metav1.NewTime(now),
+		},
+		Spec: ext.TokenSpec{
+			UserID:  userID,
+			TTL:     57600000,
+			IsLogin: true,
+		},
+		Status: ext.TokenStatus{
+			TokenHash:    tokenHash,
+			AuthProvider: fakeProvider.name,
+			DisplayName:  user.DisplayName,
+			PrincipalID:  userPrincipalID,
+		},
+	}
+	tokenSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "token-v2rcx",
+			CreationTimestamp: metav1.NewTime(now),
+		},
+		Data: map[string][]byte{
+			"enabled":       []byte("false"),
+			"is-login":      []byte("true"),
+			"ttl":           []byte("57600000"),
+			"user-id":       []byte(userID),
+			"hash":          []byte(tokenHash),
+			"auth-provider": []byte(fakeProvider.name),
+			"display-name":  []byte(user.DisplayName),
+			"login-name":    []byte(""),
+			"principal-id":  []byte(userPrincipalID),
+			"kube-uid":      []byte("2905498-kafld-lkad"),
+		},
+	}
+
+	var patchData []byte
+	ctrl := gomock.NewController(t)
+
+	userAttribute := &v3.UserAttribute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: userID,
+		},
+		GroupPrincipals: map[string]apiv3.Principals{
+			fakeProvider.name: {
+				Items: []apiv3.Principal{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: fakeProvider.name + "_group://56789",
+						},
+						MemberOf:      true,
+						LoginName:     "rancher",
+						DisplayName:   "rancher",
+						PrincipalType: "group",
+						Provider:      fakeProvider.name,
+					},
+				},
+			},
+		},
+		ExtraByProvider: map[string]map[string][]string{
+			fakeProvider.name: {
+				common.UserAttributePrincipalID: {userPrincipalID},
+				common.UserAttributeUserName:    {user.DisplayName},
+			},
+			providers.LocalProvider: {
+				common.UserAttributePrincipalID: {"local://" + userID},
+				common.UserAttributeUserName:    {"local-user"},
+			},
+		},
+	}
+	userAttributeLister := &mgmtFakes.UserAttributeListerMock{
+		GetFunc: func(namespace, name string) (*v3.UserAttribute, error) {
+			return userAttribute, nil
+		},
+	}
+
+	userLister := &mgmtFakes.UserListerMock{
+		GetFunc: func(namespace, name string) (*v3.User, error) {
+			return user, nil
+		},
+	}
+
+	userRefresher := &fakeUserRefresher{}
+
+	secrets := fake.NewMockControllerInterface[*corev1.Secret, *corev1.SecretList](ctrl)
+	secrets.EXPECT().
+		Get("cattle-tokens", token.Name, gomock.Any()).
+		Return(tokenSecret, nil).
+		AnyTimes()
+	// FIX IMPLEMENT equivalent
+	// secrets.EXPECT().Patch(token.Name, k8stypes.JSONPatchType, gomock.Any()).
+	//      DoAndReturn(func(name string, pt k8stypes.PatchType, data []byte, subresources ...any) (*apiv3.Token, error) {
+	// 	    patchData = data
+	// 	    return nil, nil
+	//      }).AnyTimes()
+
+	store := exttokenstore.NewSystemTokenStore(secrets, nil, nil, nil)
+
+	authenticator := tokenAuthenticator{
+		ctx:                 context.Background(),
+		userAttributeLister: userAttributeLister,
+		userLister:          userLister,
+		clusterRouter:       clusterrouter.GetClusterID,
+		refreshUser:         userRefresher.refreshUser,
+		now: func() time.Time {
+			return now
+		},
+		extTokenStore: store,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/namespaces", nil)
+	req.Header.Set("Authorization", "Bearer ext/"+token.Name+":"+tokenValue)
+
+	t.Run("authenticate", func(t *testing.T) {
+		patchData = nil
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.True(t, resp.IsAuthed)
+		assert.Equal(t, userID, resp.User)
+		assert.Equal(t, userPrincipalID, resp.UserPrincipal)
+		assert.Contains(t, resp.Groups, fakeProvider.name+"_group://56789")
+		assert.Contains(t, resp.Groups, "system:cattle:authenticated")
+		assert.Contains(t, resp.Extras[common.UserAttributePrincipalID], userPrincipalID)
+		assert.Contains(t, resp.Extras[common.UserAttributeUserName], "fake-user")
+		assert.True(t, userRefresher.called)
+		assert.Equal(t, userID, userRefresher.userID)
+		assert.False(t, userRefresher.force)
+		require.NotEmpty(t, patchData)
+	})
+
+	t.Run("subsecond lastUsedAt updates are throttled", func(t *testing.T) {
+		oldTokenLastUsedAt := token.Status.LastUsedAt
+		defer func() {
+			token.Status.LastUsedAt = oldTokenLastUsedAt
+		}()
+		lastUsedAt := metav1.NewTime(now.Truncate(time.Second))
+		token.Status.LastUsedAt = &lastUsedAt
+		patchData = nil
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.Empty(t, patchData)
+	})
+
+	t.Run("past and future lastUsedAt are updated", func(t *testing.T) {
+		oldTokenLastUsedAt := token.Status.LastUsedAt
+		defer func() {
+			token.Status.LastUsedAt = oldTokenLastUsedAt
+		}()
+		lastUsedAt := metav1.NewTime(now.Add(-time.Second).Truncate(time.Second))
+		token.Status.LastUsedAt = &lastUsedAt
+		patchData = nil
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.NotEmpty(t, patchData)
+
+		lastUsedAt = metav1.NewTime(now.Add(time.Second).Truncate(time.Second))
+		token.Status.LastUsedAt = &lastUsedAt
+		patchData = nil
+
+		resp, err = authenticator.Authenticate(req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.NotEmpty(t, patchData)
+	})
+
+	t.Run("error updating lastUsedAt doesn't fail the request", func(t *testing.T) {
+		oldTokenLastUsedAt := token.Status.LastUsedAt
+		defer func() {
+			token.Status.LastUsedAt = oldTokenLastUsedAt
+			// FIX	authenticator.tokenClient = tokenClient
+		}()
+		// FIX		client := fake.NewMockNonNamespacedClientInterface[*apiv3.Token, *apiv3.TokenList](ctrl)
+		// FIX		client.EXPECT().Patch(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fmt.Errorf("some error")).Times(1)
+		// FIX		authenticator.tokenClient = client
+		// FIX - modify ext token store
+
+		lastUsedAt := metav1.NewTime(now.Add(-time.Second).Truncate(time.Second))
+		token.Status.LastUsedAt = &lastUsedAt
+		patchData = nil
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.Empty(t, patchData)
+	})
+
+	t.Run("token fetched with token client", func(t *testing.T) {
+		// FIX REM defer mockIndexer.Add(token)
+		// FIX REM mockIndexer.Delete(token)
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.True(t, resp.IsAuthed)
+		assert.True(t, userRefresher.called)
+	})
+
+	t.Run("authenticate with a cluster specific token", func(t *testing.T) {
+		clusterID := "c-955nj"
+		oldTokenClusterName := token.Spec.ClusterName
+		defer func() { token.Spec.ClusterName = oldTokenClusterName }()
+		token.Spec.ClusterName = clusterID
+
+		clusterReq := httptest.NewRequest(http.MethodGet, "/k8s/clusters/"+clusterID+"/v1/management.cattle.io.authconfigs", nil)
+		clusterReq.Header.Set("Authorization", "Bearer ext/"+token.Name+":"+tokenValue)
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(clusterReq)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.True(t, resp.IsAuthed)
+		assert.True(t, userRefresher.called)
+	})
+
+	t.Run("authenticate if userattribute doesn't exist", func(t *testing.T) {
+		oldGetUserAttributeFunc := userAttributeLister.GetFunc
+		defer func() { userAttributeLister.GetFunc = oldGetUserAttributeFunc }()
+		userAttributeLister.GetFunc = func(namespace, name string) (*v3.UserAttribute, error) {
+			return nil, apierrors.NewNotFound(schema.GroupResource{}, name)
+		}
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.True(t, resp.IsAuthed)
+		assert.True(t, userRefresher.called)
+	})
+
+	t.Run("retrieve extra from the provider if missing in userattribute", func(t *testing.T) {
+		oldUserAttributeExtra := userAttribute.ExtraByProvider
+		defer func() {
+			userAttribute.ExtraByProvider = oldUserAttributeExtra
+		}()
+		userAttribute.ExtraByProvider = nil
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.True(t, resp.IsAuthed)
+		assert.True(t, userRefresher.called)
+		assert.Contains(t, resp.Extras[common.UserAttributePrincipalID], user.PrincipalIDs[0])
+		assert.Contains(t, resp.Extras[common.UserAttributeUserName], user.DisplayName)
+	})
+
+	t.Run("fill extra from the user if unable to get from neither userattribute nor provider", func(t *testing.T) {
+		oldUserAttributeExtra := userAttribute.ExtraByProvider
+		oldFakeProviderGetUserExtraAttributesFunc := fakeProvider.getUserExtraAttributesFunc
+		defer func() {
+			userAttribute.ExtraByProvider = oldUserAttributeExtra
+			fakeProvider.getUserExtraAttributesFunc = oldFakeProviderGetUserExtraAttributesFunc
+		}()
+		userAttribute.ExtraByProvider = nil
+		fakeProvider.getUserExtraAttributesFunc = func(userPrincipal v3.Principal) map[string][]string { return map[string][]string{} }
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.True(t, resp.IsAuthed)
+		assert.True(t, userRefresher.called)
+		assert.Contains(t, resp.Extras[common.UserAttributePrincipalID], user.PrincipalIDs[0])
+		assert.Contains(t, resp.Extras[common.UserAttributeUserName], user.DisplayName)
+	})
+
+	t.Run("provider refresh is not called if token user id has system prefix", func(t *testing.T) {
+		oldTokenUserID := token.Spec.UserID
+		defer func() { token.Spec.UserID = oldTokenUserID }()
+		token.Spec.UserID = "system://provisioning/fleet-local/local"
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.True(t, resp.IsAuthed)
+		assert.False(t, userRefresher.called)
+	})
+
+	t.Run("provider refresh is not called for system users", func(t *testing.T) {
+		oldGetUserFunc := userLister.GetFunc
+		defer func() { userLister.GetFunc = oldGetUserFunc }()
+		userLister.GetFunc = func(namespace, name string) (*v3.User, error) {
+			return &v3.User{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: userID,
+				},
+				PrincipalIDs: []string{
+					"system://provisioning/fleet-local/local",
+					"local://" + userID,
+				},
+			}, nil
+		}
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.True(t, resp.IsAuthed)
+		assert.False(t, userRefresher.called)
+	})
+
+	t.Run("don't check provider if not specified in the token", func(t *testing.T) {
+		oldRokenAuthProvider := token.Status.AuthProvider
+		defer func() { token.Status.AuthProvider = oldRokenAuthProvider }()
+		token.Status.AuthProvider = ""
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		assert.True(t, resp.IsAuthed)
+		assert.True(t, userRefresher.called)
+	})
+
+	t.Run("token not found", func(t *testing.T) {
+		defer func() {
+			// FIX mockIndexer.Add(token)
+			// FIX authenticator.tokenClient = tokenClient
+		}()
+		// FIX mockIndexer.Delete(token)
+		// FIX client := fake.NewMockNonNamespacedClientInterface[*apiv3.Token, *apiv3.TokenList](ctrl)
+		// FIX client.EXPECT().Get(token.Name, metav1.GetOptions{}).Return(nil, apierrors.NewNotFound(schema.GroupResource{}, token.Name)).Times(1)
+		// FIX authenticator.tokenClient = client
+		// FIX - modify ext token store
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.ErrorIs(t, err, ErrMustAuthenticate)
+		require.Nil(t, resp)
+		assert.False(t, userRefresher.called)
+	})
+
+	t.Run("failed to retrieve auth token with the token client", func(t *testing.T) {
+		defer func() {
+			// FIX mockIndexer.Add(token)
+			// FIX authenticator.tokenClient = tokenClient
+		}()
+		// FIX mockIndexer.Delete(token)
+		// FIX client := fake.NewMockNonNamespacedClientInterface[*apiv3.Token, *apiv3.TokenList](ctrl)
+		// FIX client.EXPECT().Get(token.Name, metav1.GetOptions{}).Return(nil, fmt.Errorf("some error")).Times(1)
+		// FIX authenticator.tokenClient = client
+		// FIX - modify ext token store
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.ErrorIs(t, err, ErrMustAuthenticate)
+		require.Nil(t, resp)
+		assert.False(t, userRefresher.called)
+	})
+
+	t.Run("token is disabled", func(t *testing.T) {
+		oldTokenEnabled := token.Spec.Enabled
+		defer func() { token.Spec.Enabled = oldTokenEnabled }()
+		token.Spec.Enabled = false
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.ErrorIs(t, err, ErrMustAuthenticate)
+		require.Nil(t, resp)
+		assert.False(t, userRefresher.called)
+	})
+
+	t.Run("cluster ID doesn't match", func(t *testing.T) {
+		clusterID := "c-955nj"
+		oldTokenClusterName := token.Spec.ClusterName
+		defer func() { token.Spec.ClusterName = oldTokenClusterName }()
+		token.Spec.ClusterName = clusterID
+
+		clusterReq := httptest.NewRequest(http.MethodGet, "/k8s/clusters/c-unknown/v1/management.cattle.io.authconfigs", nil)
+		clusterReq.Header.Set("Authorization", "Bearer ext/"+token.Name+":"+tokenValue)
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(clusterReq)
+		require.ErrorIs(t, err, ErrMustAuthenticate)
+		require.Nil(t, resp)
+	})
+
+	t.Run("user doesn't exist", func(t *testing.T) {
+		oldGetUserFunc := userLister.GetFunc
+		defer func() { userLister.GetFunc = oldGetUserFunc }()
+		userLister.GetFunc = func(namespace, name string) (*v3.User, error) {
+			return nil, apierrors.NewNotFound(schema.GroupResource{}, name)
+		}
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.ErrorIs(t, err, ErrMustAuthenticate)
+		require.Nil(t, resp)
+		assert.False(t, userRefresher.called)
+	})
+
+	t.Run("user is disabled", func(t *testing.T) {
+		oldGetUserFunc := userLister.GetFunc
+		defer func() { userLister.GetFunc = oldGetUserFunc }()
+		userLister.GetFunc = func(namespace, name string) (*v3.User, error) {
+			return &v3.User{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: userID,
+				},
+				Enabled: pointer.BoolPtr(false),
+			}, nil
+		}
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.ErrorIs(t, err, ErrMustAuthenticate)
+		require.Nil(t, resp)
+		assert.False(t, userRefresher.called)
+	})
+
+	t.Run("error getting userattribute", func(t *testing.T) {
+		oldGetUserAttributeFunc := userAttributeLister.GetFunc
+		defer func() { userAttributeLister.GetFunc = oldGetUserAttributeFunc }()
+		userAttributeLister.GetFunc = func(namespace, name string) (*v3.UserAttribute, error) {
+			return nil, fmt.Errorf("some error")
+		}
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.ErrorIs(t, err, ErrMustAuthenticate)
+		require.Nil(t, resp)
+		assert.False(t, userRefresher.called)
+	})
+
+	t.Run("auth provider is disabled", func(t *testing.T) {
+		oldIsDisabled := fakeProvider.disabled
+		defer func() { fakeProvider.disabled = oldIsDisabled }()
+		fakeProvider.disabled = true
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.ErrorIs(t, err, ErrMustAuthenticate)
+		require.Nil(t, resp)
+		assert.False(t, userRefresher.called)
+	})
+
+	t.Run("auth provider doesn't exist", func(t *testing.T) {
+		oldProvider := token.Status.AuthProvider
+		defer func() { token.Status.AuthProvider = oldProvider }()
+		token.Status.AuthProvider = "foo"
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.ErrorIs(t, err, ErrMustAuthenticate)
+		require.Nil(t, resp)
+		assert.False(t, userRefresher.called)
+	})
+	t.Run("failed to verify token: token expired", func(t *testing.T) {
+		oldTokenCreationTimestamp := token.CreationTimestamp
+		defer func() { token.CreationTimestamp = oldTokenCreationTimestamp }()
+		token.CreationTimestamp = metav1.NewTime(now.Add(-time.Duration(token.Spec.TTL)*time.Millisecond - 1))
+
+		userRefresher.reset()
+
+		resp, err := authenticator.Authenticate(req)
+		require.ErrorIs(t, err, ErrMustAuthenticate)
+		require.Nil(t, resp)
+		assert.False(t, userRefresher.called)
+	})
+	t.Run("failed to verify token: mismatched", func(t *testing.T) {
+		oldTokenCreationTimestamp := token.CreationTimestamp
+		defer func() { token.CreationTimestamp = oldTokenCreationTimestamp }()
+		token.CreationTimestamp = metav1.NewTime(now.Add(-time.Duration(token.Spec.TTL)*time.Millisecond - 1))
 
 		userRefresher.reset()
 
