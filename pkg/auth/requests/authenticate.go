@@ -216,7 +216,7 @@ func (a *tokenAuthenticator) Authenticate(req *http.Request) (*AuthenticatorResp
 			Value any    `json:"value"`
 		}{{
 			Op:    "replace",
-			Path:  "/lastUsedAt",
+			Path:  token.GetLUAFieldPath(),
 			Value: metav1.NewTime(now),
 		}})
 		if err != nil {
